@@ -1,0 +1,121 @@
+{
+  "name": "Webhook lab alerting (Slack)",
+  "nodes": [
+    {
+      "id": "1",
+      "name": "Every 5 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "2",
+      "name": "Check recent failures",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        240,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  (SELECT count(*) FROM webhook_events WHERE received_at > now() - interval '5 minutes' AND status LIKE 'rejected_%') AS rejected_5m,\n  (SELECT count(*) FROM webhook_events WHERE received_at > now() - interval '5 minutes' AND status = 'duplicate') AS duplicates_5m,\n  COALESCE((SELECT extract(epoch FROM now() - max(received_at))::int FROM webhook_events WHERE status = 'processed'), 999999) AS secs_since_last_processed;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "webhook-lab-postgres"
+        }
+      }
+    },
+    {
+      "id": "3",
+      "name": "Alert needed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        480,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.rejected_5m >= 3 || ($env.ALERT_ON_SILENCE === 'true' && $json.secs_since_last_processed > 1800) }}",
+              "value2": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "4",
+      "name": "Post to Slack",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        -80
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: ':warning: Webhook lab alert: ' + $json.rejected_5m + ' rejected events in the last 5 min (duplicates: ' + $json.duplicates_5m + '). Seconds since last processed event: ' + $json.secs_since_last_processed + '. Check webhook_events and runbooks/break-it-runbook.md.' }) }}",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Every 5 minutes": {
+      "main": [
+        [
+          {
+            "node": "Check recent failures",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check recent failures": {
+      "main": [
+        [
+          {
+            "node": "Alert needed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert needed?": {
+      "main": [
+        [
+          {
+            "node": "Post to Slack",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "settings": {}
+}

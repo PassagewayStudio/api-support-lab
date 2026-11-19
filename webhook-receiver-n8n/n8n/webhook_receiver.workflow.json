@@ -1,0 +1,201 @@
+{
+  "name": "Webhook receiver lab (signature, idempotency, logging)",
+  "nodes": [
+    {
+      "id": "1",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "gigs-lab",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      }
+    },
+    {
+      "id": "2",
+      "name": "Verify signature",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// n8n \"Code\" node (Run Once for All Items). Verifies a Standard Webhooks / Svix signature.\n// Requires on the n8n container:  NODE_FUNCTION_ALLOW_BUILTIN=crypto\n// Requires the Webhook node option \"Raw Body\" = ON, so we sign the exact bytes received.\n// Secret comes from the n8n env var WEBHOOK_SECRET ($env access must be allowed) - never paste it here.\nconst crypto = require('crypto');\n\nfunction verify({ rawBody, headers, secret, nowSec, toleranceSec = 300 }) {\n  const id = headers['webhook-id'];\n  const ts = headers['webhook-timestamp'];\n  const sigHeader = headers['webhook-signature'];\n  if (!id || !ts || !sigHeader) return { ok: false, reason: 'missing_headers' };\n  if (Math.abs(nowSec - Number(ts)) > toleranceSec) return { ok: false, reason: 'stale_timestamp' };\n  const key = Buffer.from(secret.split('_')[1], 'base64');\n  const expected = crypto.createHmac('sha256', key).update(`${id}.${ts}.${rawBody}`).digest();\n  for (const part of sigHeader.split(' ')) {\n    const [version, sig] = part.split(',');\n    if (version !== 'v1' || !sig) continue;\n    const got = Buffer.from(sig, 'base64');\n    if (got.length === expected.length && crypto.timingSafeEqual(got, expected)) return { ok: true };\n  }\n  return { ok: false, reason: 'bad_signature' };\n}\n\n// ---- n8n entry point (skipped when this file is loaded by the test harness) ----\nif (typeof $input !== 'undefined') {\n  const item = $input.first();\n  const raw = item.binary && item.binary.data\n    ? Buffer.from(item.binary.data.data, 'base64').toString('utf8')\n    : item.json.rawBody;\n  const result = verify({\n    rawBody: raw,\n    headers: item.json.headers,\n    secret: $env.WEBHOOK_SECRET,\n    nowSec: Math.floor(Date.now() / 1000),\n  });\n  const h = item.json.headers;\n  return [{ json: {\n    valid: result.ok, reason: result.reason || null,\n    event_id: h['webhook-id'] || null,\n    request_id: h['x-request-id'] || h['webhook-id'] || null,\n    payload_hash: crypto.createHash('sha256').update(raw || '').digest('hex'),\n    event_type: (() => { try { return JSON.parse(raw).type; } catch (e) { return null; } })(),\n    raw,\n  } }];\n}\nmodule.exports = { verify };\n"
+      }
+    },
+    {
+      "id": "3",
+      "name": "Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        480,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.valid }}",
+              "value2": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "4",
+      "name": "Insert processed or duplicate",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        720,
+        -100
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH ins AS (\n  INSERT INTO webhook_events (event_id, request_id, event_type, status, payload_hash, payload)\n  VALUES ($1, $2, $3, 'processed', $4, $5::jsonb)\n  ON CONFLICT (event_id) WHERE status = 'processed' DO NOTHING\n  RETURNING 'processed'::text AS status\n), dup AS (\n  INSERT INTO webhook_events (event_id, request_id, event_type, status, reason, payload_hash, payload)\n  SELECT $1, $2, $3, 'duplicate', 'event id already processed', $4, $5::jsonb\n  WHERE NOT EXISTS (SELECT 1 FROM ins)\n  RETURNING 'duplicate'::text AS status\n)\nSELECT status FROM ins UNION ALL SELECT status FROM dup;",
+        "options": {
+          "queryReplacement": "={{ [$('Verify signature').item.json.event_id, $('Verify signature').item.json.request_id, $('Verify signature').item.json.event_type, $('Verify signature').item.json.payload_hash, $('Verify signature').item.json.raw] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "webhook-lab-postgres"
+        }
+      }
+    },
+    {
+      "id": "5",
+      "name": "Respond 200",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        960,
+        -100
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: $json.status } }}",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    },
+    {
+      "id": "6",
+      "name": "Log rejection",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        720,
+        120
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO webhook_events (event_id, request_id, event_type, status, reason, payload_hash)\nVALUES (COALESCE($1,'unknown'), COALESCE($2,'unknown'), $3, $4, $5, $6) RETURNING status;",
+        "options": {
+          "queryReplacement": "={{ [$json.event_id, $json.request_id, $json.event_type, 'rejected_' + ($json.reason === 'stale_timestamp' ? 'stale' : 'signature'), $json.reason, $json.payload_hash] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "webhook-lab-postgres"
+        }
+      }
+    },
+    {
+      "id": "7",
+      "name": "Respond 401",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        960,
+        120
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { error: 'invalid_signature' } }}",
+        "options": {
+          "responseCode": 401
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Verify signature",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify signature": {
+      "main": [
+        [
+          {
+            "node": "Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valid?": {
+      "main": [
+        [
+          {
+            "node": "Insert processed or duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log rejection",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert processed or duplicate": {
+      "main": [
+        [
+          {
+            "node": "Respond 200",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log rejection": {
+      "main": [
+        [
+          {
+            "node": "Respond 401",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {}
+}

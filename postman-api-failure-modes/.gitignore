@@ -1,0 +1,4 @@
+.env
+*.secret
+*.postman_environment.local.json
+newman/

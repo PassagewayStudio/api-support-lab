@@ -1,0 +1,39 @@
+# Separate lab stack. Not connected to the production support bot (support.passagewaystudio.com).
+# Everything is bound to 127.0.0.1, so nothing here is reachable from outside your machine.
+services:
+  lab-postgres:
+    image: postgres:16
+    container_name: webhook-lab-postgres
+    environment:
+      POSTGRES_DB: ${LAB_DB_NAME}
+      POSTGRES_USER: ${LAB_DB_USER}
+      POSTGRES_PASSWORD: ${LAB_DB_PASSWORD}
+    volumes:
+      - lab-pg:/var/lib/postgresql/data
+      # Runs once, on first start with an empty volume
+      - ./sql/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    restart: unless-stopped
+
+  lab-n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    container_name: webhook-lab-n8n
+    depends_on:
+      - lab-postgres
+    ports:
+      - "127.0.0.1:5679:5678"
+    environment:
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
+      - ALERT_ON_SILENCE=${ALERT_ON_SILENCE:-false}
+      - NODE_FUNCTION_ALLOW_BUILTIN=crypto
+      - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+      - N8N_SECURE_COOKIE=false
+      - WEBHOOK_URL=http://localhost:5679/
+      - GENERIC_TIMEZONE=America/New_York
+    volumes:
+      - lab-n8n:/home/node/.n8n
+    restart: unless-stopped
+
+volumes:
+  lab-pg:
+  lab-n8n:
